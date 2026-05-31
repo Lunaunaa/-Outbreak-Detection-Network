@@ -54,6 +54,28 @@ zone_presence = {
 
 contamination_triggered = False
 
+# ================= ZONE RISK MODEL =================
+
+zone_risk = {
+    "zone_a": 0,
+    "zone_b": 0,
+    "zone_c": 0
+}
+
+zone_probability = {
+    "zone_a": 0,
+    "zone_b": 0,
+    "zone_c": 0
+}
+
+ZONE_GRAPH = {
+    "zone_a": ["zone_b"],
+    "zone_b": ["zone_a", "zone_c"],
+    "zone_c": ["zone_b"]
+}
+
+beacon_last_zone = {}
+beacon_entry_time = {}
 
 # ================= HAI RISK SCORE FORMULA =================
 # R = w1×norm(humidity) + w2×norm(temp) + w3×norm(CO) + w4×norm(smoke)
@@ -202,7 +224,44 @@ def run_algorithms(trigger_node, env_risk_score):
         status  = f"MATCHED at {matches}" if matches else "no match yet"
         print(f"   {name}: {status}")
 
+    # Publish to dashboard
+    payload = json.dumps({
+        "trigger_node": trigger_node,
+        "risk_score":   env_risk_score,
+        "alert":        True,
+        "timestamp":    datetime.now().strftime("%H:%M:%S"),
+        "algorithms": {
+            "bfs":      {},
+            "dijkstra": [],
+            "kmp":      {},
+            "greedy":   zones if zones else [],
+        },
+        "beacon_history": [],
+    })
+    client.publish("icu/risk/zone_a", payload)
+    print("[MQTT] Published → icu/risk/zone_a")    
+
     print("="*55 + "\n")
+
+
+# ================= ZONE RISK PROPAGATION =================
+def propagate_zone_risk(source_zone, duration_sec):
+    source_risk = zone_risk[source_zone]
+    duration_factor = min(duration_sec / 120.0, 1.0)
+    transfer_factor = 0.30 * duration_factor
+
+    for neighbor in ZONE_GRAPH[source_zone]:
+        increase = source_risk * transfer_factor
+        zone_risk[neighbor] += increase
+        zone_probability[neighbor] += int(10 * duration_factor)
+
+        if zone_probability[neighbor] > 100:
+            zone_probability[neighbor] = 100
+
+        print(f" Risk Transfer: {source_zone} -> {neighbor}")
+        print(f" Duration: {duration_sec:.1f} sec")
+        print(f" Transfer Factor: {transfer_factor:.2f}")
+        print(f" Added Risk: {increase:.2f}")
 
 
 # ================= MQTT CALLBACKS =================
@@ -225,6 +284,7 @@ def on_message(client, userdata, msg):
         parts    = topic.split("/")
         category = parts[1]   # sensor / contact
         zone     = parts[2]   # zone_a / zone_b / zone_c / gas
+        print(f"DEBUG category={category} zone={zone}")
 
         timestamp = time.time()
 
@@ -259,7 +319,6 @@ def on_message(client, userdata, msg):
                 busiest = max(zone_presence, key=lambda z: len(zone_presence[z]))
                 people  = zone_presence[busiest]
                 if people:
-                    # Compute risk using latest DHT from state if available
                     score = compute_hai_risk_score(25, 55, mq2, mq7)  # fallback temp/humidity
                     run_algorithms(people[0], score)
 
@@ -272,6 +331,10 @@ def on_message(client, userdata, msg):
 
             # ── Compute HAI Risk Score (Discrete Maths formula) ──
             score = compute_hai_risk_score(temp, humidity, mq2, mq7)
+
+            zone_risk[zone] = score
+            print("Current Zone Risk Table:", zone_risk)
+            print(f"   Stored Zone Risk: {score}")
 
             print(f"   Zone          : {zone}")
             print(f"   Temp          : {temp} °C")
@@ -300,22 +363,52 @@ def on_message(client, userdata, msg):
 
         # ============ BLE CONTACT (icu/contact/zone_x) ============
         elif category == "contact":
+            print("DEBUG: CONTACT BLOCK ENTERED")
+
             beacon_id = data.get("beacon_id", "Unknown")
+            old_zone  = beacon_last_zone.get(beacon_id)
             rssi      = data.get("rssi", -99)
 
             print(f"   BLE Beacon : {beacon_id}")
             print(f"   RSSI       : {rssi} dBm")
 
-            # Move beacon to new zone
+            # Remove from old zone
             for z in zone_presence:
                 if beacon_id in zone_presence[z]:
                     zone_presence[z].remove(beacon_id)
+
+            # Add to new zone
             if zone in zone_presence:
                 zone_presence[zone].append(beacon_id)
-                print(f"   📍 {beacon_id} moved to {zone}")
 
-            graph.events.append({"event_type": "CONTACT", "time": timestamp, "who": beacon_id, "zone": zone})
+                if beacon_id not in beacon_entry_time:
+                    beacon_entry_time[beacon_id] = time.time()
+
+                if old_zone and old_zone != zone:
+                    entry_time = beacon_entry_time.get(beacon_id, time.time())
+                    duration   = time.time() - entry_time
+
+                    print(f"\n🚶 Movement Detected: {beacon_id} {old_zone} -> {zone}")
+                    print(f"⏱ Stayed in {old_zone} for {duration:.1f} sec")
+
+                    propagate_zone_risk(old_zone, duration)
+
+                    beacon_entry_time[beacon_id] = time.time()
+
+                beacon_last_zone[beacon_id] = zone
+                print(f"    {beacon_id} moved to {zone}")
+
+            graph.events.append({
+                "event_type": "CONTACT",
+                "time"      : timestamp,
+                "who"       : beacon_id,
+                "zone"      : zone
+            })
+
             print(f"   Zone presence: {zone_presence}")
+            print("\nCurrent Zone Risks")
+            for z in zone_risk:
+                print(f"{z}: Risk={round(zone_risk[z], 2)} Prob={zone_probability[z]}%")
 
     except Exception as e:
         print(f"ERROR: {e}")
@@ -323,10 +416,12 @@ def on_message(client, userdata, msg):
 
 # ================= MAIN =================
 client = mqtt.Client()
+print("CONNECTED TO MQTT")
+print(f"Broker = {BROKER}:{PORT}")
 client.on_connect = on_connect
 client.on_message = on_message
 
-print("🏥 HAI Environment Risk Monitor Starting...")
+print("HAI Environment Risk Monitor Starting...")
 print(f"   Broker     : {BROKER}:{PORT}")
 print(f"   Thresholds : Humidity>{HUMIDITY_MOLD_RISK}% | Temp>{TEMP_PATHOGEN_OPTIMAL}°C | CO>{THRESHOLDS['mq7']} | Smoke>{THRESHOLDS['mq2']}")
 print(f"   Risk Formula: R = 0.35×norm(H) + 0.20×norm(T) + 0.25×norm(CO) + 0.20×norm(Smoke)")
