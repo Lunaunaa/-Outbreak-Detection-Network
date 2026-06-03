@@ -290,7 +290,8 @@ export default function App() {
           {/* Bottom row */}
           <div style={{ display:"grid", gridTemplateColumns:"1.2fr 1fr", gap:16, marginTop:16 }}>
             <ZoneMap data={data} />
-            <AlertPanel graphResults={graphResults} alerts={alerts} beaconHistory={beaconHistory} />
+            <AlertPanel graphResults={graphResults} alerts={alerts} beaconHistory={beaconHistory}
+              liveScores={{ zone_a: data.zone_a.score, zone_b: data.zone_b.score, zone_c: data.zone_c.score }} />
           </div>
 
         </div>

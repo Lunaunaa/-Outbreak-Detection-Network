@@ -4,16 +4,24 @@
 
 import { useState, useEffect, useRef, useCallback } from "react";
 
-const RPI_IP = "10.165.202.80";
+const RPI_IP = "10.90.115.80";
 const WS_URL = `ws://${RPI_IP}:8080`;
 
 // HAI Risk Formula: R = 0.35×norm(hum) + 0.20×norm(temp) + 0.25×norm(CO) + 0.20×norm(smoke)
-function computeScore({ temp = 25, humidity = 50, co = 100, smoke = 80 }) {
+function computeScore({ temp = 25, humidity = 50, co = 0, smoke = 0 }) {
   const normH = Math.min(humidity / 100, 1);
   const normT = Math.min((temp - 20) / 20, 1);
-  const normC = Math.min(co / 500, 1);
-  const normS = Math.min(smoke / 500, 1);
-  return Math.round((0.35 * normH + 0.20 * normT + 0.25 * normC + 0.20 * normS) * 100);
+  const normC = Math.min(co / 4000, 1);
+  const normS = Math.min(smoke / 4000, 1);
+
+  return Math.round(
+    (
+      0.35 * normH +
+      0.20 * normT +
+      0.25 * normC +
+      0.20 * normS
+    ) * 100
+  );
 }
 
 const DEFAULT_ZONE = { temp: 0, humidity: 0, co: 0, smoke: 0, rssi: null, score: 0, beacon: false };
@@ -60,19 +68,30 @@ export function useMqtt() {
       // ── Gas sensor readings ──────────────────────────────────────────────
       // Topic: icu/sensor/gas  →  { mq2, mq4, mq7 }
       // mq2=smoke, mq7=CO — broadcast to all zones (single sensor set)
-      if (topic === "icu/sensor/gas") {
-        ["zone_a", "zone_b", "zone_c"].forEach((zone) => {
-          const updated = {
-            ...next[zone],
-            smoke:   parsed.mq2 ?? next[zone].smoke,
-            co:      parsed.mq7 ?? next[zone].co,
-            methane: parsed.mq4 ?? next[zone].methane,
-          };
-          updated.score = computeScore(updated);
-          next[zone] = updated;
-        });
-      }
+      // NEW — each sensor goes to its own zone only
+if (topic === "icu/sensor/gas") {
 
+  // Zone A = MQ2
+  next.zone_a = {
+    ...next.zone_a,
+    smoke: parsed.mq2 ?? next.zone_a.smoke,
+  };
+  next.zone_a.score = computeScore(next.zone_a);
+
+  // Zone B = MQ4
+  next.zone_b = {
+    ...next.zone_b,
+    co: parsed.mq4 ?? next.zone_b.co,
+  };
+  next.zone_b.score = computeScore(next.zone_b);
+
+  // Zone C = MQ7
+  next.zone_c = {
+    ...next.zone_c,
+    co: parsed.mq7 ?? next.zone_c.co,
+  };
+  next.zone_c.score = computeScore(next.zone_c);
+}
       // ── BLE contact events ──────────────────────────────────────────────────────
       if (topic.match(/^icu\/contact\/zone_[abc]$/)) {
         const zone = topic.split("/")[2];
